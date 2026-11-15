@@ -1,0 +1,35 @@
+#!/bin/sh
+# CGI endpoint executed by althttpd for POST /jsonrpc.
+#
+# It forwards the JSON-RPC request to the aria2 instance listening on
+# loopback, so the web UI and the RPC API share a single published port.
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ "${REQUEST_METHOD:-GET}" != "POST" ]; then
+    printf 'Status: 405\r\nAllow: POST\r\nContent-Type: application/json\r\n\r\n'
+    printf '{"error":"use POST for JSON-RPC"}'
+    exit 0
+fi
+
+len=${CONTENT_LENGTH:-0}
+tmp=$(mktemp "${TMPDIR:-/tmp}/aria2-rpc.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+
+if [ "$len" -gt 0 ] 2>/dev/null; then
+    head -c "$len" >"$tmp"
+else
+    : >"$tmp"
+fi
+
+resp=$(curl -sS --max-time 60 \
+    -H 'Content-Type: application/json' \
+    --data-binary @"$tmp" \
+    "http://127.0.0.1:${ARIA2_RPC_PORT:-6800}/jsonrpc" 2>/dev/null) || {
+    printf 'Status: 502\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\r\n'
+    printf '{"jsonrpc":"2.0","id":null,"error":{"code":502,"message":"aria2 RPC is unreachable"}}'
+    exit 0
+}
+
+printf 'Content-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: %s\r\n\r\n' "${#resp}"
+printf '%s' "$resp"

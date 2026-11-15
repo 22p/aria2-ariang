@@ -1,0 +1,114 @@
+name: Build container image
+
+on:
+  schedule:
+    - cron: "0 0 1,15 * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when the AriaNg version is unchanged
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: aria2-ariang
+  QUAY_USER: ${{ secrets.QUAY_USER || vars.QUAY_USER }}
+
+jobs:
+  build:
+    name: Build multi-arch image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Resolve versions
+        id: releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          current="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest" \
+            | jq -r '.tag_name // empty' 2>/dev/null || true)"
+          target="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/mayswind/AriaNg/releases/latest" \
+            | jq -r '.tag_name // empty' 2>/dev/null || true)"
+          if [ -z "$target" ]; then
+            echo "unable to resolve the latest AriaNg release" >&2
+            exit 1
+          fi
+          build=false
+          if [ "$current" != "$target" ]; then
+            build=true
+          fi
+          if [ "$FORCE" = "true" ]; then
+            build=true
+          fi
+          {
+            echo "current=$current"
+            echo "target=$target"
+            echo "build=$build"
+            echo "owner=${GITHUB_REPOSITORY_OWNER,,}"
+          } >> "$GITHUB_OUTPUT"
+          echo "current=${current:-<none>} target=${target} build=${build}"
+
+      - name: Build image
+        id: build-image
+        if: steps.releases.outputs.build == 'true'
+        uses: redhat-actions/buildah-build@v3
+        with:
+          image: ${{ env.IMAGE_NAME }}
+          tags: latest ${{ steps.releases.outputs.target }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ steps.releases.outputs.target }}
+            ARIANG_VERSION=${{ steps.releases.outputs.target }}
+          containerfiles: |
+            ./Dockerfile
+
+      - name: Push to Quay
+        if: steps.releases.outputs.build == 'true' && env.QUAY_USER != ''
+        uses: redhat-actions/push-to-registry@v3
+        with:
+          image: ${{ steps.build-image.outputs.image }}
+          tags: ${{ steps.build-image.outputs.tags }}
+          registry: quay.io/${{ env.QUAY_USER }}
+          username: ${{ env.QUAY_USER }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Push to GHCR
+        if: steps.releases.outputs.build == 'true'
+        uses: redhat-actions/push-to-registry@v3
+        with:
+          image: ${{ steps.build-image.outputs.image }}
+          tags: ${{ steps.build-image.outputs.tags }}
+          registry: ghcr.io/${{ steps.releases.outputs.owner }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create release
+        if: steps.releases.outputs.build == 'true' && steps.releases.outputs.current != steps.releases.outputs.target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.releases.outputs.target }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists"
+          else
+            gh release create "$TAG" \
+              --title "AriaNg $TAG" \
+              --notes "Container image built from ${GITHUB_SHA} with AriaNg ${TAG}." \
+              --target "$GITHUB_SHA"
+          fi
